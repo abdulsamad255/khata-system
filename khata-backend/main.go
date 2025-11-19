@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
+	"net/smtp"
 	"os"
 	"strconv"
 	"time"
@@ -12,6 +16,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/joho/godotenv"
+	"github.com/jung-kurt/gofpdf"
 	_ "github.com/lib/pq"
 )
 
@@ -35,7 +40,7 @@ type Entry struct {
 }
 
 func main() {
-	// Load .env (for DATABASE_URL, PORT)
+	// Load .env (for DATABASE_URL, SMTP settings, etc.)
 	_ = godotenv.Load()
 
 	dsn := os.Getenv("DATABASE_URL")
@@ -74,6 +79,9 @@ func main() {
 	r.Get("/api/customers/{id}/entries", listEntriesHandler)
 	r.Post("/api/customers/{id}/entries", createEntryHandler)
 
+	// NEW: send khata PDF to customer's email
+	r.Post("/api/customers/{id}/send-email", sendCustomerEmailHandler)
+
 	log.Println("Backend listening on port", port)
 	if err := http.ListenAndServe(":"+port, r); err != nil {
 		log.Fatal(err)
@@ -98,7 +106,7 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// ---------- Handlers ----------
+// ---------- Basic Handlers ----------
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -117,8 +125,7 @@ func listCustomersHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	// IMPORTANT: start with an empty slice, not nil, so JSON encodes as []
-	customers := []Customer{}
+	customers := []Customer{} // non-nil slice
 
 	for rows.Next() {
 		var c Customer
@@ -223,8 +230,7 @@ func listEntriesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	// IMPORTANT: start with empty slice, not nil
-	entries := []Entry{}
+	entries := []Entry{} // non-nil slice
 
 	for rows.Next() {
 		var e Entry
@@ -291,6 +297,233 @@ func createEntryHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusCreated, entry)
+}
+
+// ---------- Phase 2: Email with PDF ----------
+
+// POST /api/customers/{id}/send-email
+func sendCustomerEmailHandler(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	customerID, err := strconv.Atoi(idStr)
+	if err != nil {
+		httpError(w, http.StatusBadRequest, "invalid customer id")
+		return
+	}
+
+	// 1. Get customer
+	var c Customer
+	err = db.QueryRow(`
+		SELECT id, name, phone, email, created_at
+		FROM customers
+		WHERE id = $1
+	`, customerID).Scan(&c.ID, &c.Name, &c.Phone, &c.Email, &c.CreatedAt)
+	if err == sql.ErrNoRows {
+		httpError(w, http.StatusNotFound, "customer not found")
+		return
+	} else if err != nil {
+		httpError(w, http.StatusInternalServerError, "failed to get customer")
+		return
+	}
+
+	if c.Email == "" {
+		httpError(w, http.StatusBadRequest, "customer has no email")
+		return
+	}
+
+	// 2. Get entries
+	rows, err := db.Query(`
+		SELECT id, customer_id, type, amount, note, created_at
+		FROM entries
+		WHERE customer_id = $1
+		ORDER BY created_at ASC
+	`, customerID)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "failed to query entries")
+		return
+	}
+	defer rows.Close()
+
+	entries := []Entry{}
+	for rows.Next() {
+		var e Entry
+		if err := rows.Scan(&e.ID, &e.CustomerID, &e.Type, &e.Amount, &e.Note, &e.CreatedAt); err != nil {
+			httpError(w, http.StatusInternalServerError, "failed to scan entry")
+			return
+		}
+		entries = append(entries, e)
+	}
+
+	// 3. Generate PDF bytes
+	pdfData, err := generateKhataPDF(c, entries)
+	if err != nil {
+		log.Println("generate PDF error:", err)
+		httpError(w, http.StatusInternalServerError, "failed to generate PDF")
+		return
+	}
+
+	// 4. Prepare email text
+	var totalDebit, totalCredit float64
+	for _, e := range entries {
+		if e.Type == "debit" {
+			totalDebit += e.Amount
+		} else if e.Type == "credit" {
+			totalCredit += e.Amount
+		}
+	}
+	balance := totalDebit - totalCredit
+
+	body := fmt.Sprintf(
+		"Assalam o Alaikum %s,\n\nHere is your khata summary:\n\nTotal Debit : %.2f\nTotal Credit: %.2f\nBalance     : %.2f\n\nThe detailed khata is attached as a PDF.\n\nJazakAllah,\n%s",
+		c.Name,
+		totalDebit,
+		totalCredit,
+		balance,
+		getFromName(),
+	)
+
+	subject := "Your Khata Details"
+
+	// 5. Send email with PDF attachment
+	if err := sendEmailWithPDF(c.Email, subject, body, pdfData, fmt.Sprintf("khata-customer-%d.pdf", c.ID)); err != nil {
+		log.Println("send email error:", err)
+		// changed here: show real error message
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"message": "email sent"})
+}
+
+// generateKhataPDF creates a simple PDF summary of the customer's khata.
+func generateKhataPDF(c Customer, entries []Entry) ([]byte, error) {
+	pdf := gofpdf.New("P", "mm", "A4", "")
+	pdf.AddPage()
+
+	// Title
+	pdf.SetFont("Arial", "B", 16)
+	pdf.Cell(0, 10, "Khata Summary")
+	pdf.Ln(12)
+
+	// Customer info
+	pdf.SetFont("Arial", "", 12)
+	pdf.Cell(0, 6, fmt.Sprintf("Customer: %s", c.Name))
+	pdf.Ln(6)
+	pdf.Cell(0, 6, fmt.Sprintf("Phone: %s", c.Phone))
+	pdf.Ln(6)
+	pdf.Cell(0, 6, fmt.Sprintf("Email: %s", c.Email))
+	pdf.Ln(10)
+
+	// Totals
+	var totalDebit, totalCredit float64
+	for _, e := range entries {
+		if e.Type == "debit" {
+			totalDebit += e.Amount
+		} else if e.Type == "credit" {
+			totalCredit += e.Amount
+		}
+	}
+	balance := totalDebit - totalCredit
+
+	pdf.Cell(0, 6, fmt.Sprintf("Total Debit : %.2f", totalDebit))
+	pdf.Ln(6)
+	pdf.Cell(0, 6, fmt.Sprintf("Total Credit: %.2f", totalCredit))
+	pdf.Ln(6)
+	pdf.Cell(0, 6, fmt.Sprintf("Balance     : %.2f", balance))
+	pdf.Ln(10)
+
+	// Table header
+	pdf.SetFont("Arial", "B", 12)
+	pdf.CellFormat(35, 7, "Date", "1", 0, "", false, 0, "")
+	pdf.CellFormat(25, 7, "Type", "1", 0, "", false, 0, "")
+	pdf.CellFormat(30, 7, "Amount", "1", 0, "", false, 0, "")
+	pdf.CellFormat(100, 7, "Note", "1", 1, "", false, 0, "")
+
+	// Table rows
+	pdf.SetFont("Arial", "", 11)
+	for _, e := range entries {
+		dateStr := e.CreatedAt.Format("2006-01-02 15:04")
+		pdf.CellFormat(35, 6, dateStr, "1", 0, "", false, 0, "")
+		pdf.CellFormat(25, 6, e.Type, "1", 0, "", false, 0, "")
+		pdf.CellFormat(30, 6, fmt.Sprintf("%.2f", e.Amount), "1", 0, "", false, 0, "")
+		pdf.CellFormat(100, 6, e.Note, "1", 1, "", false, 0, "")
+	}
+
+	var buf bytes.Buffer
+	if err := pdf.Output(&buf); err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
+}
+
+func getFromName() string {
+	name := os.Getenv("FROM_NAME")
+	if name == "" {
+		name = "Khata System"
+	}
+	return name
+}
+
+// sendEmailWithPDF sends an email with the given PDF as attachment.
+func sendEmailWithPDF(to, subject, body string, pdfData []byte, filename string) error {
+	smtpHost := os.Getenv("SMTP_HOST")
+	smtpPort := os.Getenv("SMTP_PORT")
+	smtpUser := os.Getenv("SMTP_USER")
+	smtpPass := os.Getenv("SMTP_PASS")
+	fromEmail := os.Getenv("FROM_EMAIL")
+	fromName := getFromName()
+
+	if smtpHost == "" || smtpPort == "" || smtpUser == "" || smtpPass == "" {
+		return fmt.Errorf("SMTP configuration is missing")
+	}
+
+	if fromEmail == "" {
+		fromEmail = smtpUser
+	}
+
+	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
+
+	// Build MIME email
+	var buf bytes.Buffer
+	boundary := "khata-boundary-123456"
+
+	// Headers
+	buf.WriteString(fmt.Sprintf("From: %s <%s>\r\n", fromName, fromEmail))
+	buf.WriteString(fmt.Sprintf("To: %s\r\n", to))
+	buf.WriteString(fmt.Sprintf("Subject: %s\r\n", subject))
+	buf.WriteString("MIME-Version: 1.0\r\n")
+	buf.WriteString(fmt.Sprintf("Content-Type: multipart/mixed; boundary=%s\r\n", boundary))
+	buf.WriteString("\r\n")
+
+	// Body part
+	buf.WriteString(fmt.Sprintf("--%s\r\n", boundary))
+	buf.WriteString("Content-Type: text/plain; charset=\"utf-8\"\r\n")
+	buf.WriteString("Content-Transfer-Encoding: 7bit\r\n\r\n")
+	buf.WriteString(body)
+	buf.WriteString("\r\n")
+
+	// Attachment part
+	buf.WriteString(fmt.Sprintf("--%s\r\n", boundary))
+	buf.WriteString("Content-Type: application/pdf\r\n")
+	buf.WriteString("Content-Transfer-Encoding: base64\r\n")
+	buf.WriteString(fmt.Sprintf("Content-Disposition: attachment; filename=\"%s\"\r\n\r\n", filename))
+
+	// Base64-encode PDF data, wrap lines at 76 chars
+	b64 := base64.StdEncoding.EncodeToString(pdfData)
+	for i := 0; i < len(b64); i += 76 {
+		end := i + 76
+		if end > len(b64) {
+			end = len(b64)
+		}
+		buf.WriteString(b64[i:end])
+		buf.WriteString("\r\n")
+	}
+
+	// End boundary
+	buf.WriteString(fmt.Sprintf("--%s--\r\n", boundary))
+
+	addr := smtpHost + ":" + smtpPort
+	return smtp.SendMail(addr, auth, fromEmail, []string{to}, buf.Bytes())
 }
 
 // ---------- Helpers ----------

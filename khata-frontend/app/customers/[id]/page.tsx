@@ -4,7 +4,8 @@ import React, { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8080";
+const API_BASE_URL =
+  process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8080";
 
 type Customer = {
   id: number;
@@ -38,20 +39,27 @@ export default function CustomerPage() {
   const [note, setNote] = useState("");
   const [saving, setSaving] = useState(false);
 
+  const [emailSending, setEmailSending] = useState(false);
+  const [emailMessage, setEmailMessage] = useState<string | null>(null);
+
   const fetchData = async () => {
     try {
       setError(null);
       setLoading(true);
 
       // Fetch customer
-      const customerRes = await fetch(`${API_BASE_URL}/api/customers/${id}`);
+      const customerRes = await fetch(
+        `${API_BASE_URL}/api/customers/${id}`
+      );
       if (!customerRes.ok) {
         throw new Error("Failed to load customer");
       }
       const customerData: Customer = await customerRes.json();
 
       // Fetch entries
-      const entriesRes = await fetch(`${API_BASE_URL}/api/customers/${id}/entries`);
+      const entriesRes = await fetch(
+        `${API_BASE_URL}/api/customers/${id}/entries`
+      );
       if (!entriesRes.ok) {
         throw new Error("Failed to load entries");
       }
@@ -95,15 +103,18 @@ export default function CustomerPage() {
     setError(null);
 
     try {
-      const res = await fetch(`${API_BASE_URL}/api/customers/${id}/entries`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          type: entryType,
-          amount: amt,
-          note,
-        }),
-      });
+      const res = await fetch(
+        `${API_BASE_URL}/api/customers/${id}/entries`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            type: entryType,
+            amount: amt,
+            note,
+          }),
+        }
+      );
 
       if (!res.ok) {
         const body = await res.json().catch(() => null);
@@ -117,6 +128,37 @@ export default function CustomerPage() {
       setError(err.message || "Error creating entry");
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleSendEmail = async () => {
+    if (!customer?.email) {
+      setError("Customer has no email set.");
+      return;
+    }
+
+    setEmailSending(true);
+    setEmailMessage(null);
+    setError(null);
+
+    try {
+      const res = await fetch(
+        `${API_BASE_URL}/api/customers/${id}/send-email`,
+        {
+          method: "POST",
+        }
+      );
+
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        throw new Error(body?.error || "Failed to send email");
+      }
+
+      setEmailMessage("Email sent successfully to customer.");
+    } catch (err: any) {
+      setError(err.message || "Error sending email");
+    } finally {
+      setEmailSending(false);
     }
   };
 
@@ -169,20 +211,48 @@ export default function CustomerPage() {
           </Link>
         </div>
 
-        <h1 className="text-2xl font-bold mb-1">Khata for {customer.name}</h1>
+        <h1 className="text-2xl font-bold mb-1">
+          Khata for {customer.name}
+        </h1>
         <p className="text-gray-700 mb-4">
-          Phone: {customer.phone || "N/A"} | Email: {customer.email || "N/A"}
+          Phone: {customer.phone || "N/A"} | Email:{" "}
+          {customer.email || "N/A"}
         </p>
 
-        {/* Summary */}
+        {/* Email status */}
+        {emailMessage && (
+          <div className="mb-3 text-sm text-green-700 bg-green-100 border border-green-200 rounded px-3 py-2">
+            {emailMessage}
+          </div>
+        )}
+
+        {/* Summary + Send Email Button */}
         <section className="mb-8 bg-white p-4 rounded shadow">
-          <h2 className="text-lg font-semibold mb-2">Summary</h2>
+          <div className="flex items-center justify-between mb-2">
+            <h2 className="text-lg font-semibold">Summary</h2>
+            <button
+              onClick={handleSendEmail}
+              disabled={emailSending || !customer.email}
+              className="bg-indigo-600 text-white px-3 py-1 rounded text-sm disabled:opacity-60"
+            >
+              {emailSending ? "Sending..." : "Send Khata to Email"}
+            </button>
+          </div>
+          {!customer.email && (
+            <p className="text-xs text-red-600 mb-2">
+              Customer has no email set. Please add email in admin first.
+            </p>
+          )}
           <div className="space-y-1 text-sm">
             <p>Total Debit: {totalDebit.toFixed(2)}</p>
             <p>Total Credit: {totalCredit.toFixed(2)}</p>
             <p>
               Balance:{" "}
-              <span className={balance > 0 ? "text-red-600" : "text-green-600"}>
+              <span
+                className={
+                  balance > 0 ? "text-red-600" : "text-green-600"
+                }
+              >
                 {balance.toFixed(2)}
               </span>
             </p>
@@ -192,25 +262,30 @@ export default function CustomerPage() {
         {/* New entry form */}
         <section className="mb-8 bg-white p-4 rounded shadow">
           <h2 className="text-lg font-semibold mb-2">Add Entry</h2>
-          {error && (
-            <div className="mb-2 text-sm text-red-600">
-              {error}
-            </div>
-          )}
           <form onSubmit={handleCreateEntry} className="space-y-3">
             <div>
-              <label className="block text-sm font-medium mb-1">Type</label>
+              <label className="block text-sm font-medium mb-1">
+                Type
+              </label>
               <select
                 className="border rounded px-3 py-2 w-full"
                 value={entryType}
-                onChange={(e) => setEntryType(e.target.value as "debit" | "credit")}
+                onChange={(e) =>
+                  setEntryType(e.target.value as "debit" | "credit")
+                }
               >
-                <option value="debit">Debit (Customer owes you)</option>
-                <option value="credit">Credit (Customer paid you)</option>
+                <option value="debit">
+                  Debit (Customer owes you)
+                </option>
+                <option value="credit">
+                  Credit (Customer paid you)
+                </option>
               </select>
             </div>
             <div>
-              <label className="block text-sm font-medium mb-1">Amount</label>
+              <label className="block text-sm font-medium mb-1">
+                Amount
+              </label>
               <input
                 className="border rounded px-3 py-2 w-full"
                 value={amount}
@@ -219,7 +294,9 @@ export default function CustomerPage() {
               />
             </div>
             <div>
-              <label className="block text-sm font-medium mb-1">Note</label>
+              <label className="block text-sm font-medium mb-1">
+                Note
+              </label>
               <input
                 className="border rounded px-3 py-2 w-full"
                 value={note}
