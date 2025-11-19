@@ -82,6 +82,10 @@ func main() {
 	// NEW: send khata PDF to customer's email
 	r.Post("/api/customers/{id}/send-email", sendCustomerEmailHandler)
 
+	// Phase 3: Customer Portal APIs (ADDED)
+	r.Post("/api/portal/khata-lookup", portalKhataLookupHandler)
+	r.Get("/api/portal/customers/{id}/pdf", portalCustomerPDFHandler)
+
 	log.Println("Backend listening on port", port)
 	if err := http.ListenAndServe(":"+port, r); err != nil {
 		log.Fatal(err)
@@ -536,4 +540,159 @@ func writeJSON(w http.ResponseWriter, status int, data any) {
 
 func httpError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// ---------- Phase 3: Customer Portal Handlers (ADDED) ----------
+
+type portalLookupRequest struct {
+	Email string `json:"email"`
+	Phone string `json:"phone"`
+}
+
+type portalKhataResponse struct {
+	Customer Customer `json:"customer"`
+	Totals   struct {
+		Debit   float64 `json:"debit"`
+		Credit  float64 `json:"credit"`
+		Balance float64 `json:"balance"`
+	} `json:"totals"`
+	Entries []Entry `json:"entries"`
+}
+
+// POST /api/portal/khata-lookup
+// Body: { "email": "...", "phone": "..." }
+func portalKhataLookupHandler(w http.ResponseWriter, r *http.Request) {
+	var req portalLookupRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+
+	if req.Email == "" || req.Phone == "" {
+		httpError(w, http.StatusBadRequest, "email and phone are required")
+		return
+	}
+
+	// 1. Find customer by email + phone
+	var c Customer
+	err := db.QueryRow(`
+		SELECT id, name, phone, email, created_at
+		FROM customers
+		WHERE email = $1 AND phone = $2
+		LIMIT 1
+	`, req.Email, req.Phone).Scan(&c.ID, &c.Name, &c.Phone, &c.Email, &c.CreatedAt)
+	if err == sql.ErrNoRows {
+		httpError(w, http.StatusNotFound, "no khata found for this email and phone")
+		return
+	} else if err != nil {
+		httpError(w, http.StatusInternalServerError, "failed to find customer")
+		return
+	}
+
+	// 2. Get entries for that customer
+	rows, err := db.Query(`
+		SELECT id, customer_id, type, amount, note, created_at
+		FROM entries
+		WHERE customer_id = $1
+		ORDER BY created_at ASC
+	`, c.ID)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "failed to query entries")
+		return
+	}
+	defer rows.Close()
+
+	entries := []Entry{}
+	var totalDebit, totalCredit float64
+
+	for rows.Next() {
+		var e Entry
+		if err := rows.Scan(&e.ID, &e.CustomerID, &e.Type, &e.Amount, &e.Note, &e.CreatedAt); err != nil {
+			httpError(w, http.StatusInternalServerError, "failed to scan entry")
+			return
+		}
+		entries = append(entries, e)
+
+		if e.Type == "debit" {
+			totalDebit += e.Amount
+		} else if e.Type == "credit" {
+			totalCredit += e.Amount
+		}
+	}
+
+	balance := totalDebit - totalCredit
+
+	var resp portalKhataResponse
+	resp.Customer = c
+	resp.Totals.Debit = totalDebit
+	resp.Totals.Credit = totalCredit
+	resp.Totals.Balance = balance
+	resp.Entries = entries
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// GET /api/portal/customers/{id}/pdf
+// Returns a PDF for direct download (customer portal)
+func portalCustomerPDFHandler(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	customerID, err := strconv.Atoi(idStr)
+	if err != nil {
+		httpError(w, http.StatusBadRequest, "invalid customer id")
+		return
+	}
+
+	// 1. Get customer
+	var c Customer
+	err = db.QueryRow(`
+		SELECT id, name, phone, email, created_at
+		FROM customers
+		WHERE id = $1
+	`, customerID).Scan(&c.ID, &c.Name, &c.Phone, &c.Email, &c.CreatedAt)
+	if err == sql.ErrNoRows {
+		httpError(w, http.StatusNotFound, "customer not found")
+		return
+	} else if err != nil {
+		httpError(w, http.StatusInternalServerError, "failed to get customer")
+		return
+	}
+
+	// 2. Get entries
+	rows, err := db.Query(`
+		SELECT id, customer_id, type, amount, note, created_at
+		FROM entries
+		WHERE customer_id = $1
+		ORDER BY created_at ASC
+	`, customerID)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "failed to query entries")
+		return
+	}
+	defer rows.Close()
+
+	entries := []Entry{}
+	for rows.Next() {
+		var e Entry
+		if err := rows.Scan(&e.ID, &e.CustomerID, &e.Type, &e.Amount, &e.Note, &e.CreatedAt); err != nil {
+			httpError(w, http.StatusInternalServerError, "failed to scan entry")
+			return
+		}
+		entries = append(entries, e)
+	}
+
+	// 3. Generate PDF
+	pdfData, err := generateKhataPDF(c, entries)
+	if err != nil {
+		log.Println("portal PDF generate error:", err)
+		httpError(w, http.StatusInternalServerError, "failed to generate PDF")
+		return
+	}
+
+	// 4. Send PDF as download
+	filename := fmt.Sprintf("khata-customer-%d.pdf", c.ID)
+
+	w.Header().Set("Content-Type", "application/pdf")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(pdfData)
 }
